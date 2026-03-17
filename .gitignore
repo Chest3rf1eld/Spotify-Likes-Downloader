@@ -1,1 +1,11 @@
-music
+music/
+.download_state/
+
+download.log
+failed.txt
+songs.txt
+
+__pycache__/
+*.py[cod]
+
+*.part

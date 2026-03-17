@@ -27,6 +27,8 @@ PARALLEL_JOBS = int(os.environ.get("PARALLEL_JOBS", "8"))
 YT_DLP_PROXY = os.environ.get("YT_DLP_PROXY", "http://127.0.0.1:2080")
 YT_DLP_CONCURRENT_FRAGMENTS = int(os.environ.get("YT_DLP_CONCURRENT_FRAGMENTS", "1"))
 FFMPEG_THREADS = int(os.environ.get("FFMPEG_THREADS", "1"))
+YT_DLP_COOKIES_FILE = os.environ.get("YT_DLP_COOKIES_FILE", "")
+YT_DLP_COOKIES_FROM_BROWSER = os.environ.get("YT_DLP_COOKIES_FROM_BROWSER", "")
 
 SUFFIX_PATTERN = re.compile(
     r"\s*[-–]\s*(\d{4}\s+remaster|remaster(ed)?(?:\s+\d{4})?|demo|edit|radio edit|mono|stereo|live|version)\b.*$",
@@ -34,6 +36,7 @@ SUFFIX_PATTERN = re.compile(
 )
 INVALID_FILENAME_CHARS = re.compile(r'[/\\:*?"<>|]')
 WHITESPACE_PATTERN = re.compile(r"\s+")
+PAREN_CONTENT_PATTERN = re.compile(r"\s*[\(\[\{].*?[\)\]\}]\s*")
 
 
 @dataclass(frozen=True)
@@ -55,6 +58,12 @@ def normalize_spaces(value: str) -> str:
 def clean_track_name(track_name: str) -> str:
     track_name = normalize_spaces(track_name)
     return SUFFIX_PATTERN.sub("", track_name).strip() or track_name
+
+
+def strip_parenthetical(value: str) -> str:
+    simplified = PAREN_CONTENT_PATTERN.sub(" ", value)
+    simplified = normalize_spaces(simplified)
+    return simplified or value
 
 
 def extract_year(release_date: str) -> str:
@@ -277,6 +286,12 @@ class Downloader:
                 )
 
     def download_with_queries(self, output_base: Path, search_queries: list[str]) -> bool:
+        cookies_args: list[str] = []
+        if YT_DLP_COOKIES_FILE:
+            cookies_args = ["--cookies", YT_DLP_COOKIES_FILE]
+        elif YT_DLP_COOKIES_FROM_BROWSER:
+            cookies_args = ["--cookies-from-browser", YT_DLP_COOKIES_FROM_BROWSER]
+
         for search_query in search_queries:
             if not search_query:
                 continue
@@ -286,6 +301,7 @@ class Downloader:
                 "yt-dlp",
                 "--proxy",
                 YT_DLP_PROXY,
+                *cookies_args,
                 f"ytsearch1:{search_query}",
                 "-x",
                 "--audio-format",
@@ -427,12 +443,27 @@ def build_tracks() -> list[Track]:
             ]
             primary_variants = canonical_parts[0]
             search_track = clean_track_name(track_name)
+            simplified_track = strip_parenthetical(search_track)
+            all_artists_joined = " ".join(display_artist_parts)
+            album_without_track = album if album.casefold() != track_name.casefold() else ""
 
             search_queries = []
-            for artist_variant in primary_variants + [""]:
-                query = " ".join(part for part in [artist_variant, search_track, album, year, "audio"] if part)
+            artist_variants = unique_preserve_order(primary_variants + [all_artists_joined, ""])
+            track_variants = unique_preserve_order([search_track, simplified_track])
+
+            def add_query(*parts: str) -> None:
+                query = " ".join(part for part in parts if part)
                 if query and query not in search_queries:
                     search_queries.append(query)
+
+            for artist_variant in artist_variants:
+                for track_variant in track_variants:
+                    add_query(artist_variant, track_variant, album_without_track, year, "audio")
+                    add_query(artist_variant, track_variant, album_without_track, "audio")
+                    add_query(artist_variant, track_variant, year, "audio")
+                    add_query(artist_variant, track_variant, "official audio")
+                    add_query(artist_variant, track_variant, "audio")
+                    add_query(artist_variant, track_variant)
 
             tracks.append(
                 Track(

@@ -1,0 +1,9 @@
+# track_uri<TAB>target1<TAB>target2...
+# target can be:
+# - an exact YouTube URL
+# - a yt-dlp search target, e.g. ytsearch5:Artist Track
+# - a plain query string, which will be treated as ytsearch1:query
+#
+# Example:
+# spotify:track:1234567890	https://www.youtube.com/watch?v=VIDEO_ID
+# spotify:track:abcdef	ytsearch5:Artist Song live

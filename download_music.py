@@ -17,6 +17,7 @@ from pathlib import Path
 MUSIC_DIR = Path("music")
 CSV_FILE = Path("Liked_Songs.csv")
 ALIASES_FILE = Path("artist_aliases.tsv")
+TRACK_OVERRIDES_FILE = Path("track_overrides.tsv")
 FAILED_FILE = Path("failed.txt")
 LOG_FILE = Path("download.log")
 STATE_DIR = Path(".download_state")
@@ -37,18 +38,20 @@ SUFFIX_PATTERN = re.compile(
 INVALID_FILENAME_CHARS = re.compile(r'[/\\:*?"<>|]')
 WHITESPACE_PATTERN = re.compile(r"\s+")
 PAREN_CONTENT_PATTERN = re.compile(r"\s*[\(\[\{].*?[\)\]\}]\s*")
+FEAT_PATTERN = re.compile(r"\s*(feat\.?|ft\.?).*$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
 class Track:
     track_uri: str
     artists: str
+    artist_parts: list[str]
     display_artists: str
     canonical_artists: str
     track_name: str
     album_name: str
     year: str
-    search_queries: list[str]
+    search_targets: list[str]
 
 
 def normalize_spaces(value: str) -> str:
@@ -64,6 +67,16 @@ def strip_parenthetical(value: str) -> str:
     simplified = PAREN_CONTENT_PATTERN.sub(" ", value)
     simplified = normalize_spaces(simplified)
     return simplified or value
+
+
+def strip_feature_suffix(value: str) -> str:
+    simplified = FEAT_PATTERN.sub("", value)
+    simplified = normalize_spaces(simplified)
+    return simplified or value
+
+
+def simplify_search_text(value: str) -> str:
+    return strip_feature_suffix(strip_parenthetical(value))
 
 
 def extract_year(release_date: str) -> str:
@@ -117,6 +130,23 @@ def load_aliases(path: Path) -> dict[str, list[str]]:
             if canonicals:
                 aliases[alias.casefold()] = canonicals
     return aliases
+
+
+def load_track_overrides(path: Path) -> dict[str, list[str]]:
+    overrides: dict[str, list[str]] = {}
+    if not path.exists():
+        return overrides
+
+    with path.open(encoding="utf-8") as file:
+        for raw_line in file:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [normalize_spaces(part) for part in raw_line.split("\t")]
+            if len(parts) < 2 or not parts[0]:
+                continue
+            overrides[parts[0]] = unique_preserve_order(parts[1:])
+    return overrides
 
 
 def canonicalize_artist_variants(artist: str, aliases: dict[str, list[str]]) -> list[str]:
@@ -271,6 +301,7 @@ class Downloader:
         self.progress = Progress(len(tracks))
         self.log_lock = threading.Lock()
         self.fail_lock = threading.Lock()
+        self.failed_entries: dict[str, str] = {}
 
     def append_log(self, message: str) -> None:
         with self.log_lock:
@@ -279,30 +310,49 @@ class Downloader:
 
     def log_failure(self, track: Track) -> None:
         with self.fail_lock:
-            with FAILED_FILE.open("a", encoding="utf-8") as file:
-                file.write(
-                    f"{track.track_uri} | {track.display_artists} - {track.track_name} | "
-                    f"search: {'|||'.join(track.search_queries)}\n"
-                )
+            self.failed_entries[track.track_uri] = (
+                f"{track.track_uri} | {track.display_artists} - {track.track_name} | "
+                f"search: {'|||'.join(track.search_targets)}"
+            )
 
-    def download_with_queries(self, output_base: Path, search_queries: list[str]) -> bool:
+    def clear_failure(self, track: Track) -> None:
+        with self.fail_lock:
+            self.failed_entries.pop(track.track_uri, None)
+
+    def flush_failures(self) -> None:
+        with self.fail_lock:
+            unresolved = []
+            for track in self.tracks:
+                entry = self.failed_entries.get(track.track_uri)
+                if not entry:
+                    continue
+                safe_artists = sanitize_filename_part(track.display_artists)
+                safe_track = sanitize_filename_part(track.track_name)
+                output_file = (MUSIC_DIR / f"{safe_artists} - {safe_track}").with_suffix(".mp3")
+                if is_track_uri_downloaded(track.track_uri) or is_complete_mp3(output_file):
+                    continue
+                unresolved.append(entry)
+            FAILED_FILE.write_text(("\n".join(unresolved) + "\n") if unresolved else "", encoding="utf-8")
+
+    def download_with_queries(self, output_base: Path, search_targets: list[str]) -> bool:
         cookies_args: list[str] = []
         if YT_DLP_COOKIES_FILE:
             cookies_args = ["--cookies", YT_DLP_COOKIES_FILE]
         elif YT_DLP_COOKIES_FROM_BROWSER:
             cookies_args = ["--cookies-from-browser", YT_DLP_COOKIES_FROM_BROWSER]
 
-        for search_query in search_queries:
-            if not search_query:
+        for search_target in search_targets:
+            if not search_target:
                 continue
 
-            self.append_log(f"[search] {output_base} | query: {search_query}\n")
+            self.append_log(f"[search] {output_base} | target: {search_target}\n")
+            yt_target = search_target if ":" in search_target.split("/", 1)[0] or search_target.startswith("http") else f"ytsearch1:{search_target}"
             command = [
                 "yt-dlp",
                 "--proxy",
                 YT_DLP_PROXY,
                 *cookies_args,
-                f"ytsearch1:{search_query}",
+                yt_target,
                 "-x",
                 "--audio-format",
                 "mp3",
@@ -357,9 +407,10 @@ class Downloader:
         output_file.unlink(missing_ok=True)
         cleanup_output_sidecars(output_base)
 
-        if self.download_with_queries(output_base, track.search_queries) and is_complete_mp3(output_file):
+        if self.download_with_queries(output_base, track.search_targets) and is_complete_mp3(output_file):
             cleanup_output_sidecars(output_base)
             register_track_uri(track.track_uri, output_file)
+            self.clear_failure(track)
             self.progress.update("downloaded")
             return "downloaded"
 
@@ -406,10 +457,12 @@ class Downloader:
 
             if self.shutdown.is_stopping():
                 self.progress.print_message("Graceful shutdown complete.")
+        self.flush_failures()
 
 
 def build_tracks() -> list[Track]:
     aliases = load_aliases(ALIASES_FILE)
+    overrides = load_track_overrides(TRACK_OVERRIDES_FILE)
     seen_uris = set()
     tracks: list[Track] = []
 
@@ -444,37 +497,64 @@ def build_tracks() -> list[Track]:
             primary_variants = canonical_parts[0]
             search_track = clean_track_name(track_name)
             simplified_track = strip_parenthetical(search_track)
+            minimal_track = simplify_search_text(search_track)
+            simplified_album = simplify_search_text(album)
             all_artists_joined = " ".join(display_artist_parts)
             album_without_track = album if album.casefold() != track_name.casefold() else ""
+            short_track = len(minimal_track.split()) <= 2
 
-            search_queries = []
-            artist_variants = unique_preserve_order(primary_variants + [all_artists_joined, ""])
-            track_variants = unique_preserve_order([search_track, simplified_track])
+            search_targets: list[str] = []
 
-            def add_query(*parts: str) -> None:
+            def add_target(*parts: str, search_size: int = 1) -> None:
                 query = " ".join(part for part in parts if part)
-                if query and query not in search_queries:
-                    search_queries.append(query)
+                if not query:
+                    return
+                target = f"ytsearch{search_size}:{query}"
+                if target not in search_targets:
+                    search_targets.append(target)
+
+            for override in overrides.get(track_uri, []):
+                if override not in search_targets:
+                    search_targets.append(override)
+
+            artist_variants = unique_preserve_order(
+                primary_variants + display_artist_parts[:2] + artist_parts[:2] + [all_artists_joined]
+            )
+            track_variants = unique_preserve_order([search_track, simplified_track, minimal_track])
 
             for artist_variant in artist_variants:
                 for track_variant in track_variants:
-                    add_query(artist_variant, track_variant, album_without_track, year, "audio")
-                    add_query(artist_variant, track_variant, album_without_track, "audio")
-                    add_query(artist_variant, track_variant, year, "audio")
-                    add_query(artist_variant, track_variant, "official audio")
-                    add_query(artist_variant, track_variant, "audio")
-                    add_query(artist_variant, track_variant)
+                    add_target(artist_variant, track_variant, album_without_track, year, "audio")
+                    add_target(artist_variant, track_variant, album_without_track, "audio")
+                    add_target(artist_variant, track_variant, year, "audio")
+                    add_target(artist_variant, track_variant, "official audio")
+                    add_target(artist_variant, track_variant, "audio")
+                    add_target(track_variant, artist_variant, "audio")
+                    add_target(artist_variant, track_variant)
+                    if short_track:
+                        add_target(artist_variant, track_variant, simplified_album, "audio")
+                        add_target(track_variant, simplified_album, artist_variant)
+
+            for track_variant in track_variants:
+                add_target(track_variant, simplified_album, year, "audio")
+                add_target(track_variant, simplified_album, "audio")
+                add_target(track_variant, year, "audio")
+                add_target(track_variant, "official audio")
+                add_target(track_variant, "audio")
+                add_target(track_variant)
+                add_target(track_variant, search_size=5)
 
             tracks.append(
                 Track(
                     track_uri=track_uri,
                     artists=artists,
+                    artist_parts=artist_parts,
                     display_artists=";".join(display_artist_parts) if display_artist_parts else artists,
                     canonical_artists=";".join("/".join(variants) for variants in canonical_parts) if canonical_parts else artists,
                     track_name=track_name,
                     album_name=album,
                     year=year,
-                    search_queries=search_queries,
+                    search_targets=search_targets,
                 )
             )
 
@@ -488,7 +568,7 @@ def build_tracks() -> list[Track]:
                 track.track_name,
                 track.album_name,
                 track.year,
-                "|||".join(track.search_queries),
+                "|||".join(track.search_targets),
             ]
             file.write("\t".join(field.replace("\t", " ").replace("\n", " ") for field in fields) + "\n")
 

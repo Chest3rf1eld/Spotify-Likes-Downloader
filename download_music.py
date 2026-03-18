@@ -24,7 +24,8 @@ STATE_DIR = Path(".download_state")
 TRACKS_FILE = STATE_DIR / "tracks.tsv"
 TRACK_URI_DIR = STATE_DIR / "by_track_uri"
 PROGRESS_FILE = STATE_DIR / "progress.tsv"
-PARALLEL_JOBS = int(os.environ.get("PARALLEL_JOBS", "8"))
+RESOLVED_TARGETS_FILE = STATE_DIR / "resolved_targets.tsv"
+PARALLEL_JOBS = int(os.environ.get("PARALLEL_JOBS", "6"))
 YT_DLP_PROXY = os.environ.get("YT_DLP_PROXY", "http://127.0.0.1:2080")
 YT_DLP_CONCURRENT_FRAGMENTS = int(os.environ.get("YT_DLP_CONCURRENT_FRAGMENTS", "1"))
 FFMPEG_THREADS = int(os.environ.get("FFMPEG_THREADS", "1"))
@@ -149,6 +150,26 @@ def load_track_overrides(path: Path) -> dict[str, list[str]]:
     return overrides
 
 
+def load_resolved_targets(path: Path) -> dict[str, str]:
+    resolved: dict[str, str] = {}
+    if not path.exists():
+        return resolved
+
+    with path.open(encoding="utf-8") as file:
+        for raw_line in file:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = raw_line.rstrip("\n").split("\t", 1)
+            if len(parts) != 2:
+                continue
+            track_uri = normalize_spaces(parts[0])
+            target = normalize_spaces(parts[1])
+            if track_uri and target:
+                resolved[track_uri] = target
+    return resolved
+
+
 def canonicalize_artist_variants(artist: str, aliases: dict[str, list[str]]) -> list[str]:
     artist = normalize_spaces(artist)
     return unique_preserve_order(aliases.get(artist.casefold(), []) + [artist])
@@ -165,6 +186,10 @@ def track_uri_key(track_uri: str) -> str:
 
 def track_uri_marker(track_uri: str) -> Path:
     return TRACK_URI_DIR / f"{track_uri_key(track_uri)}.path"
+
+
+def output_path_for_base(output_base: Path, suffix: str) -> Path:
+    return output_base.parent / f"{output_base.name}{suffix}"
 
 
 def is_complete_mp3(file_path: Path) -> bool:
@@ -218,7 +243,7 @@ def is_track_uri_downloaded(track_uri: str) -> bool:
 
 def cleanup_output_sidecars(output_base: Path) -> None:
     for suffix in (".webm", ".m4a", ".opus", ".webp", ".jpg", ".png", ".part"):
-        output_base.with_suffix(suffix).unlink(missing_ok=True)
+        output_path_for_base(output_base, suffix).unlink(missing_ok=True)
 
 
 def format_duration(total_seconds: int) -> str:
@@ -301,7 +326,9 @@ class Downloader:
         self.progress = Progress(len(tracks))
         self.log_lock = threading.Lock()
         self.fail_lock = threading.Lock()
+        self.resolved_lock = threading.Lock()
         self.failed_entries: dict[str, str] = {}
+        self.resolved_targets = load_resolved_targets(RESOLVED_TARGETS_FILE)
 
     def append_log(self, message: str) -> None:
         with self.log_lock:
@@ -328,31 +355,80 @@ class Downloader:
                     continue
                 safe_artists = sanitize_filename_part(track.display_artists)
                 safe_track = sanitize_filename_part(track.track_name)
-                output_file = (MUSIC_DIR / f"{safe_artists} - {safe_track}").with_suffix(".mp3")
+                output_base = MUSIC_DIR / f"{safe_artists} - {safe_track}"
+                output_file = output_path_for_base(output_base, ".mp3")
                 if is_track_uri_downloaded(track.track_uri) or is_complete_mp3(output_file):
                     continue
                 unresolved.append(entry)
             FAILED_FILE.write_text(("\n".join(unresolved) + "\n") if unresolved else "", encoding="utf-8")
 
-    def download_with_queries(self, output_base: Path, search_targets: list[str]) -> bool:
+    def yt_dlp_base_args(self) -> list[str]:
         cookies_args: list[str] = []
         if YT_DLP_COOKIES_FILE:
             cookies_args = ["--cookies", YT_DLP_COOKIES_FILE]
         elif YT_DLP_COOKIES_FROM_BROWSER:
             cookies_args = ["--cookies-from-browser", YT_DLP_COOKIES_FROM_BROWSER]
+        return ["yt-dlp", "--proxy", YT_DLP_PROXY, *cookies_args]
 
+    def cached_targets_for(self, track: Track) -> list[str]:
+        with self.resolved_lock:
+            cached = self.resolved_targets.get(track.track_uri, "")
+        if not cached:
+            return []
+        return [cached] if cached not in track.search_targets else [cached]
+
+    def save_resolved_target(self, track_uri: str, target: str) -> None:
+        if not target:
+            return
+        with self.resolved_lock:
+            self.resolved_targets[track_uri] = target
+            lines = [f"{uri}\t{resolved}" for uri, resolved in sorted(self.resolved_targets.items())]
+            RESOLVED_TARGETS_FILE.write_text(("\n".join(lines) + "\n") if lines else "", encoding="utf-8")
+
+    def resolve_target(self, search_target: str) -> str:
+        if search_target.startswith("http://") or search_target.startswith("https://"):
+            return search_target
+        if not search_target.startswith("ytsearch"):
+            return search_target
+
+        command = [
+            *self.yt_dlp_base_args(),
+            "--flat-playlist",
+            "--playlist-end",
+            "1",
+            "--print",
+            "webpage_url",
+            search_target,
+        ]
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            start_new_session=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return search_target
+
+        for line in result.stdout.splitlines():
+            resolved = line.strip()
+            if resolved.startswith("http://") or resolved.startswith("https://"):
+                return resolved
+        return search_target
+
+    def download_with_queries(self, output_base: Path, search_targets: list[str]) -> tuple[bool, str]:
         for search_target in search_targets:
             if not search_target:
                 continue
 
             self.append_log(f"[search] {output_base} | target: {search_target}\n")
             yt_target = search_target if ":" in search_target.split("/", 1)[0] or search_target.startswith("http") else f"ytsearch1:{search_target}"
+            effective_target = self.resolve_target(yt_target)
+            if effective_target != yt_target:
+                self.append_log(f"[resolve] {output_base} | {yt_target} -> {effective_target}\n")
             command = [
-                "yt-dlp",
-                "--proxy",
-                YT_DLP_PROXY,
-                *cookies_args,
-                yt_target,
+                *self.yt_dlp_base_args(),
+                effective_target,
                 "-x",
                 "--audio-format",
                 "mp3",
@@ -385,15 +461,15 @@ class Downloader:
                     check=False,
                 )
             if result.returncode == 0:
-                return True
+                return True, effective_target
 
-        return False
+        return False, ""
 
     def download_track(self, track: Track) -> str:
         safe_artists = sanitize_filename_part(track.display_artists)
         safe_track = sanitize_filename_part(track.track_name)
         output_base = MUSIC_DIR / f"{safe_artists} - {safe_track}"
-        output_file = output_base.with_suffix(".mp3")
+        output_file = output_path_for_base(output_base, ".mp3")
 
         if is_track_uri_downloaded(track.track_uri):
             self.progress.update("skipped")
@@ -407,9 +483,12 @@ class Downloader:
         output_file.unlink(missing_ok=True)
         cleanup_output_sidecars(output_base)
 
-        if self.download_with_queries(output_base, track.search_targets) and is_complete_mp3(output_file):
+        search_targets = unique_preserve_order(self.cached_targets_for(track) + track.search_targets)
+        success, resolved_target = self.download_with_queries(output_base, search_targets)
+        if success and is_complete_mp3(output_file):
             cleanup_output_sidecars(output_base)
             register_track_uri(track.track_uri, output_file)
+            self.save_resolved_target(track.track_uri, resolved_target)
             self.clear_failure(track)
             self.progress.update("downloaded")
             return "downloaded"
@@ -524,9 +603,7 @@ def build_tracks() -> list[Track]:
 
             for artist_variant in artist_variants:
                 for track_variant in track_variants:
-                    add_target(artist_variant, track_variant, album_without_track, year, "audio")
                     add_target(artist_variant, track_variant, album_without_track, "audio")
-                    add_target(artist_variant, track_variant, year, "audio")
                     add_target(artist_variant, track_variant, "official audio")
                     add_target(artist_variant, track_variant, "audio")
                     add_target(track_variant, artist_variant, "audio")
@@ -534,15 +611,17 @@ def build_tracks() -> list[Track]:
                     if short_track:
                         add_target(artist_variant, track_variant, simplified_album, "audio")
                         add_target(track_variant, simplified_album, artist_variant)
+                    add_target(artist_variant, track_variant, album_without_track, year, "audio")
+                    add_target(artist_variant, track_variant, year, "audio")
 
             for track_variant in track_variants:
-                add_target(track_variant, simplified_album, year, "audio")
                 add_target(track_variant, simplified_album, "audio")
-                add_target(track_variant, year, "audio")
                 add_target(track_variant, "official audio")
                 add_target(track_variant, "audio")
                 add_target(track_variant)
                 add_target(track_variant, search_size=5)
+                add_target(track_variant, simplified_album, year, "audio")
+                add_target(track_variant, year, "audio")
 
             tracks.append(
                 Track(
@@ -582,6 +661,7 @@ def ensure_environment() -> None:
     FAILED_FILE.write_text("", encoding="utf-8")
     LOG_FILE.write_text("", encoding="utf-8")
     TRACKS_FILE.write_text("", encoding="utf-8")
+    RESOLVED_TARGETS_FILE.touch(exist_ok=True)
 
     if shutil.which("yt-dlp") is None:
         raise SystemExit("yt-dlp is required but was not found in PATH")

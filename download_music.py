@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import csv
 import os
 import re
@@ -15,7 +16,8 @@ from pathlib import Path
 
 
 MUSIC_DIR = Path("music")
-CSV_FILE = Path("Liked_Songs.csv")
+DEFAULT_CSV_FILE = "Liked_Songs.csv"
+CSV_FILE = Path(os.environ.get("SPOTIFY_CSV_FILE", DEFAULT_CSV_FILE))
 ALIASES_FILE = Path("artist_aliases.tsv")
 TRACK_OVERRIDES_FILE = Path("track_overrides.tsv")
 FAILED_FILE = Path("failed.txt")
@@ -55,6 +57,18 @@ class Track:
     album_name: str
     year: str
     search_targets: list[str]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Download tracks from a Spotify Liked Songs CSV export."
+    )
+    parser.add_argument(
+        "--csv",
+        default=os.environ.get("SPOTIFY_CSV_FILE", DEFAULT_CSV_FILE),
+        help="Path to a Spotify CSV export in Exportify-compatible format.",
+    )
+    return parser.parse_args()
 
 
 def normalize_spaces(value: str) -> str:
@@ -789,6 +803,9 @@ def install_signal_handlers(shutdown: ShutdownController) -> None:
 
 
 def main() -> int:
+    global CSV_FILE
+    args = parse_args()
+    CSV_FILE = Path(args.csv)
     ensure_environment()
     shutdown = ShutdownController()
     install_signal_handlers(shutdown)

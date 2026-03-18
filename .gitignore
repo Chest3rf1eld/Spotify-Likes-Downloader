@@ -4,6 +4,8 @@ music/
 download.log
 failed.txt
 songs.txt
+Liked_Songs.csv
+track_overrides.tsv
 
 __pycache__/
 *.py[cod]
@@ -15,4 +17,3 @@ venv/
 
 *.part
 .DS_Store
-download.log

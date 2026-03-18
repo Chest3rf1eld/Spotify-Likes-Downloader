@@ -25,12 +25,14 @@ TRACKS_FILE = STATE_DIR / "tracks.tsv"
 TRACK_URI_DIR = STATE_DIR / "by_track_uri"
 PROGRESS_FILE = STATE_DIR / "progress.tsv"
 RESOLVED_TARGETS_FILE = STATE_DIR / "resolved_targets.tsv"
-PARALLEL_JOBS = int(os.environ.get("PARALLEL_JOBS", "6"))
+PARALLEL_JOBS = int(os.environ.get("PARALLEL_JOBS", "4"))
 YT_DLP_PROXY = os.environ.get("YT_DLP_PROXY", "http://127.0.0.1:2080")
 YT_DLP_CONCURRENT_FRAGMENTS = int(os.environ.get("YT_DLP_CONCURRENT_FRAGMENTS", "1"))
 FFMPEG_THREADS = int(os.environ.get("FFMPEG_THREADS", "1"))
 YT_DLP_COOKIES_FILE = os.environ.get("YT_DLP_COOKIES_FILE", "")
 YT_DLP_COOKIES_FROM_BROWSER = os.environ.get("YT_DLP_COOKIES_FROM_BROWSER", "")
+ENABLE_FILE_LOG = os.environ.get("ENABLE_FILE_LOG", "").lower() in {"1", "true", "yes", "on"}
+PROGRESS_FLUSH_EVERY = max(1, int(os.environ.get("PROGRESS_FLUSH_EVERY", "25")))
 
 SUFFIX_PATTERN = re.compile(
     r"\s*[-–]\s*(\d{4}\s+remaster|remaster(ed)?(?:\s+\d{4})?|demo|edit|radio edit|mono|stereo|live|version)\b.*$",
@@ -192,6 +194,34 @@ def output_path_for_base(output_base: Path, suffix: str) -> Path:
     return output_base.parent / f"{output_base.name}{suffix}"
 
 
+def track_uri_suffix(track_uri: str, length: int = 8) -> str:
+    suffix = track_uri.rsplit(":", 1)[-1]
+    return sanitize_filename_part(suffix[-length:] or suffix)
+
+
+def candidate_output_bases(track: Track) -> list[Path]:
+    safe_artists = sanitize_filename_part(track.display_artists)
+    safe_track = sanitize_filename_part(track.track_name)
+    safe_album = sanitize_filename_part(track.album_name)
+    safe_year = sanitize_filename_part(track.year)
+
+    candidates = [MUSIC_DIR / f"{safe_artists} - {safe_track}"]
+    if safe_album:
+        candidates.append(MUSIC_DIR / f"{safe_artists} - {safe_track} [{safe_album}]")
+    if safe_album and safe_year:
+        candidates.append(MUSIC_DIR / f"{safe_artists} - {safe_track} [{safe_album}] [{safe_year}]")
+    candidates.append(MUSIC_DIR / f"{safe_artists} - {safe_track} [{track_uri_suffix(track.track_uri)}]")
+    deduped: list[Path] = []
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return deduped
+
+
 def is_complete_mp3(file_path: Path) -> bool:
     if not file_path.exists() or file_path.stat().st_size <= 0:
         return False
@@ -228,16 +258,22 @@ def register_track_uri(track_uri: str, output_file: Path) -> None:
     track_uri_marker(track_uri).write_text(str(output_file) + "\n", encoding="utf-8")
 
 
-def is_track_uri_downloaded(track_uri: str) -> bool:
+def marker_output_file(track_uri: str) -> Path | None:
     marker = track_uri_marker(track_uri)
     if not marker.exists():
-        return False
+        return None
+    lines = marker.read_text(encoding="utf-8").splitlines()
+    return Path(lines[0]) if lines else None
 
-    output_file = Path(marker.read_text(encoding="utf-8").splitlines()[0])
+
+def is_track_uri_downloaded(track_uri: str) -> bool:
+    output_file = marker_output_file(track_uri)
+    if output_file is None:
+        return False
     if is_complete_mp3(output_file):
         return True
 
-    marker.unlink(missing_ok=True)
+    track_uri_marker(track_uri).unlink(missing_ok=True)
     return False
 
 
@@ -263,7 +299,17 @@ class Progress:
         self.failed = 0
         self.downloaded = 0
         self.lock = threading.Lock()
-        PROGRESS_FILE.write_text("0\t0\t0\t0\n", encoding="utf-8")
+        self.last_flushed_completed = -1
+        self.flush()
+
+    def flush(self) -> None:
+        if self.completed == self.last_flushed_completed:
+            return
+        PROGRESS_FILE.write_text(
+            f"{self.completed}\t{self.skipped}\t{self.failed}\t{self.downloaded}\n",
+            encoding="utf-8",
+        )
+        self.last_flushed_completed = self.completed
 
     def update(self, status: str) -> None:
         with self.lock:
@@ -275,10 +321,8 @@ class Progress:
             elif status == "downloaded":
                 self.downloaded += 1
 
-            PROGRESS_FILE.write_text(
-                f"{self.completed}\t{self.skipped}\t{self.failed}\t{self.downloaded}\n",
-                encoding="utf-8",
-            )
+            if self.completed == self.total_tracks or self.completed % PROGRESS_FLUSH_EVERY == 0:
+                self.flush()
             self.render()
 
     def render(self) -> None:
@@ -329,8 +373,50 @@ class Downloader:
         self.resolved_lock = threading.Lock()
         self.failed_entries: dict[str, str] = {}
         self.resolved_targets = load_resolved_targets(RESOLVED_TARGETS_FILE)
+        self.resolved_targets_dirty = False
+        self.path_owners = self.load_path_owners()
+
+    def load_path_owners(self) -> dict[str, set[str]]:
+        owners: dict[str, set[str]] = {}
+        for marker in TRACK_URI_DIR.glob("*.path"):
+            lines = marker.read_text(encoding="utf-8").splitlines()
+            if not lines:
+                continue
+            path = lines[0]
+            owners.setdefault(path, set()).add(marker.stem.removesuffix(".path"))
+        return owners
+
+    def output_path_conflicts(self, output_file: Path, track_uri: str) -> bool:
+        owners = self.path_owners.get(str(output_file), set())
+        return any(owner != track_uri_key(track_uri) for owner in owners)
+
+    def claim_output_path(self, output_file: Path, track_uri: str) -> None:
+        self.path_owners.setdefault(str(output_file), set()).add(track_uri_key(track_uri))
+
+    def is_track_uri_downloaded_for_track(self, track: Track) -> bool:
+        output_file = marker_output_file(track.track_uri)
+        if output_file is None:
+            return False
+        if self.output_path_conflicts(output_file, track.track_uri):
+            return False
+        if is_complete_mp3(output_file):
+            self.claim_output_path(output_file, track.track_uri)
+            return True
+        track_uri_marker(track.track_uri).unlink(missing_ok=True)
+        return False
+
+    def choose_output_base(self, track: Track) -> Path:
+        candidates = candidate_output_bases(track)
+        for candidate in candidates:
+            output_base = Path(candidate)
+            output_file = output_path_for_base(output_base, ".mp3")
+            if not self.output_path_conflicts(output_file, track.track_uri):
+                return output_base
+        return candidates[-1]
 
     def append_log(self, message: str) -> None:
+        if not ENABLE_FILE_LOG:
+            return
         with self.log_lock:
             with LOG_FILE.open("a", encoding="utf-8") as file:
                 file.write(message)
@@ -353,11 +439,9 @@ class Downloader:
                 entry = self.failed_entries.get(track.track_uri)
                 if not entry:
                     continue
-                safe_artists = sanitize_filename_part(track.display_artists)
-                safe_track = sanitize_filename_part(track.track_name)
-                output_base = MUSIC_DIR / f"{safe_artists} - {safe_track}"
+                output_base = self.choose_output_base(track)
                 output_file = output_path_for_base(output_base, ".mp3")
-                if is_track_uri_downloaded(track.track_uri) or is_complete_mp3(output_file):
+                if self.is_track_uri_downloaded_for_track(track) or is_complete_mp3(output_file):
                     continue
                 unresolved.append(entry)
             FAILED_FILE.write_text(("\n".join(unresolved) + "\n") if unresolved else "", encoding="utf-8")
@@ -381,9 +465,19 @@ class Downloader:
         if not target:
             return
         with self.resolved_lock:
+            current = self.resolved_targets.get(track_uri)
+            if current == target:
+                return
             self.resolved_targets[track_uri] = target
+            self.resolved_targets_dirty = True
+
+    def flush_resolved_targets(self) -> None:
+        with self.resolved_lock:
+            if not self.resolved_targets_dirty:
+                return
             lines = [f"{uri}\t{resolved}" for uri, resolved in sorted(self.resolved_targets.items())]
             RESOLVED_TARGETS_FILE.write_text(("\n".join(lines) + "\n") if lines else "", encoding="utf-8")
+            self.resolved_targets_dirty = False
 
     def resolve_target(self, search_target: str) -> str:
         if search_target.startswith("http://") or search_target.startswith("https://"):
@@ -417,6 +511,7 @@ class Downloader:
         return search_target
 
     def download_with_queries(self, output_base: Path, search_targets: list[str]) -> tuple[bool, str]:
+        output_file = output_path_for_base(output_base, ".mp3")
         for search_target in search_targets:
             if not search_target:
                 continue
@@ -452,30 +547,42 @@ class Downloader:
                 "--output",
                 f"{output_base}.%(ext)s",
             ]
-            with LOG_FILE.open("a", encoding="utf-8") as log_file:
+            if ENABLE_FILE_LOG:
+                with LOG_FILE.open("a", encoding="utf-8") as log_file:
+                    result = subprocess.run(
+                        command,
+                        stdout=log_file,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                        check=False,
+                    )
+            else:
                 result = subprocess.run(
                     command,
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                     start_new_session=True,
                     check=False,
                 )
-            if result.returncode == 0:
+            if is_complete_mp3(output_file):
                 return True, effective_target
+            if result.returncode == 0:
+                self.append_log(f"[retry] {output_base} | no valid mp3 produced for target: {effective_target}\n")
+            output_file.unlink(missing_ok=True)
+            cleanup_output_sidecars(output_base)
 
         return False, ""
 
     def download_track(self, track: Track) -> str:
-        safe_artists = sanitize_filename_part(track.display_artists)
-        safe_track = sanitize_filename_part(track.track_name)
-        output_base = MUSIC_DIR / f"{safe_artists} - {safe_track}"
+        output_base = self.choose_output_base(track)
         output_file = output_path_for_base(output_base, ".mp3")
 
-        if is_track_uri_downloaded(track.track_uri):
+        if self.is_track_uri_downloaded_for_track(track):
             self.progress.update("skipped")
             return "skipped"
 
         if is_complete_mp3(output_file):
+            self.claim_output_path(output_file, track.track_uri)
             register_track_uri(track.track_uri, output_file)
             self.progress.update("skipped")
             return "skipped"
@@ -487,6 +594,7 @@ class Downloader:
         success, resolved_target = self.download_with_queries(output_base, search_targets)
         if success and is_complete_mp3(output_file):
             cleanup_output_sidecars(output_base)
+            self.claim_output_path(output_file, track.track_uri)
             register_track_uri(track.track_uri, output_file)
             self.save_resolved_target(track.track_uri, resolved_target)
             self.clear_failure(track)
@@ -536,6 +644,8 @@ class Downloader:
 
             if self.shutdown.is_stopping():
                 self.progress.print_message("Graceful shutdown complete.")
+        self.progress.flush()
+        self.flush_resolved_targets()
         self.flush_failures()
 
 
@@ -690,7 +800,9 @@ def main() -> int:
         "Settings: "
         f"parallel_jobs={PARALLEL_JOBS}, "
         f"concurrent_fragments={YT_DLP_CONCURRENT_FRAGMENTS}, "
-        f"ffmpeg_threads={FFMPEG_THREADS}"
+        f"ffmpeg_threads={FFMPEG_THREADS}, "
+        f"file_log={'on' if ENABLE_FILE_LOG else 'off'}, "
+        f"progress_flush_every={PROGRESS_FLUSH_EVERY}"
     )
     Downloader(tracks, shutdown).run()
     return 130 if shutdown.is_stopping() else 0

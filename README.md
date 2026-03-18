@@ -40,6 +40,8 @@ Before running the downloader, you need a Spotify CSV export saved as `Liked_Son
 
 One simple option is to export your library with Exportify:
 
+https://exportify.net/
+
 1. Open Exportify
 2. Sign in with Spotify
 3. Export your `Liked Songs`

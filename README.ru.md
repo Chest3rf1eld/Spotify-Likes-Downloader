@@ -40,6 +40,8 @@
 
 Один из простых вариантов — получить его через Exportify:
 
+https://exportify.net/
+
 1. Открыть Exportify
 2. Войти через Spotify
 3. Экспортировать `Liked Songs`

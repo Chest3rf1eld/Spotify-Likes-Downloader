@@ -114,12 +114,12 @@ This avoids collisions between different Spotify tracks with the same visible me
 
 ## Artist Aliases
 
-`artist_aliases.tsv` lets you map alternate spellings or transliterations to a preferred canonical artist name.
+`artist_aliases.tsv` lets you map alternate spellings or transliterations to one or more preferred canonical artist names. All canonical names are tried as search query variants; for the output filename, a Cyrillic canonical (one with `ё` preferred) is used when available.
 
 Format:
 
 ```text
-Alias<TAB>Canonical Name
+Alias<TAB>Canonical Name 1<TAB>Canonical Name 2...
 ```
 
 Example:
@@ -127,6 +127,7 @@ Example:
 ```text
 Noize MC	Нойз МС
 Zemfira	Земфира
+Petr Pogodaev	Петр Погодаев	Пётр Погодаев
 ```
 
 To help maintain aliases:
@@ -138,15 +139,15 @@ python3 update_artist_aliases.py --review-disputed
 
 ## Track Overrides
 
-`track_overrides.tsv` lets you override the generated search targets for a specific Spotify track URI.
+`track_overrides.tsv` lets you override the generated search targets for a specific Spotify track URI. You can list multiple targets per line; they are tried in order before the automatically generated search queries.
 
 Format:
 
 ```text
-spotify:track:...<TAB>ytsearch1:custom query
+spotify:track:...<TAB>target1<TAB>target2...
 ```
 
-You can also provide direct URLs instead of `ytsearch...` queries.
+Each target can be a direct URL, a `ytsearch<N>:query` search target, or a plain query string (treated as `ytsearch1:query`).
 
 ## Privacy
 
